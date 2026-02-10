@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:gamma-api.polymarket.com)",
+      "WebFetch(domain:docs.polymarket.com)",
+      "Bash(python:*)",
+      "Bash(pip install:*)",
+      "Bash(findstr:*)",
+      "Bash(timeout:*)",
+      "Bash(dir:*)"
+    ]
+  }
+}
