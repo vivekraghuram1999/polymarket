@@ -104,7 +104,22 @@ HEADER_STYLE = {
 # ---------------------------------------------------------------------------
 # Paper Trade Persistence
 # ---------------------------------------------------------------------------
-# Vercel has a read-only filesystem; use /tmp there
+# Use MongoDB when MONGODB_URI is set (Vercel), fall back to local JSON file.
+MONGODB_URI = os.environ.get("MONGODB_URI", "")
+_mongo_db = None
+
+if MONGODB_URI:
+    try:
+        from pymongo import MongoClient
+        _mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+        _mongo_db = _mongo_client["polymarket"]
+        _mongo_db.command("ping")  # verify connection
+        print("[MongoDB] Connected successfully", flush=True)
+    except Exception as e:
+        print(f"[MongoDB] Connection failed, falling back to file: {e}", flush=True)
+        _mongo_db = None
+
+# Local file fallback
 if os.environ.get("VERCEL"):
     PAPER_TRADES_FILE = "/tmp/paper_trades.json"
 else:
@@ -112,6 +127,13 @@ else:
 
 
 def load_paper_trades():
+    if _mongo_db is not None:
+        try:
+            docs = list(_mongo_db.paper_trades.find({}, {"_id": 0}))
+            return docs
+        except Exception as e:
+            print(f"[MongoDB] load failed: {e}", flush=True)
+    # Fallback to file
     if not os.path.exists(PAPER_TRADES_FILE):
         return []
     try:
@@ -122,6 +144,15 @@ def load_paper_trades():
 
 
 def save_paper_trades(trades):
+    if _mongo_db is not None:
+        try:
+            _mongo_db.paper_trades.delete_many({})
+            if trades:
+                _mongo_db.paper_trades.insert_many([dict(t) for t in trades])
+            return
+        except Exception as e:
+            print(f"[MongoDB] save failed: {e}", flush=True)
+    # Fallback to file
     with open(PAPER_TRADES_FILE, "w") as f:
         json.dump(trades, f, indent=2)
 

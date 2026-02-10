@@ -1,1 +1,32 @@
-﻿[]
+[
+  {
+    "trade_id": "1ceb5877",
+    "market_id": "1357762",
+    "question": "XRP Up or Down - February 9, 9:00PM-9:15PM ET",
+    "clob_id": "72030757043535151831886491248117221683025560341659337907757798762651732762540",
+    "side": "DOWN",
+    "entry_price": 0.9753,
+    "shares": 102.53,
+    "cost": 99.9975,
+    "entry_time": "2026-02-10T02:11:01.531443+00:00",
+    "expiry_time": "2026-02-10T02:15:00+00:00",
+    "status": "open",
+    "resolution": null,
+    "payout": null,
+    "net_pnl": null,
+    "resolved_at": null,
+    "book_snapshot": {
+      "best_bid": "0.930",
+      "best_ask": "0.960",
+      "spread": "0.030",
+      "book_depth_shares": "5,637",
+      "book_depth_usd": "$5,563",
+      "worst_fill": "0.980",
+      "levels_eaten": "3",
+      "bid_depth_usd": "$4,174",
+      "verdict": "GOOD",
+      "roi_at_entry": "2.48%",
+      "net_profit_est": "$24.82"
+    }
+  }
+]
