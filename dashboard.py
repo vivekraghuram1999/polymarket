@@ -1,9 +1,10 @@
 """
 Polymarket Near-Expiry Dashboard (Dash + Plotly)
 =================================================
-Two tabs:
+Three tabs:
   1. Live Scanner - real-time near-expiry market scanner with order book depth
   2. Paper Trading - auto-places best trades from scanner, monitors positions
+  3. Backtesting - simulate strategy on recently resolved markets
 
 Usage:
   pip install dash plotly requests pandas
@@ -13,6 +14,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -62,7 +64,7 @@ COLORS = {
 # Sports Filter
 # ---------------------------------------------------------------------------
 SPORTS_KEYWORDS = [
-    "super bowl", "nfl", "nba", "mlb", "nhl", "mls", "wnba",
+    "super bowl", "nfl", "nba", "mlb", "nhl", "mls", "wnba", "ncaa",
     "premier league", "la liga", "serie a", "bundesliga", "ligue 1",
     "champions league", "europa league", "world cup", "fifa",
     "olympic", "olympics", "grand slam", "grand prix", "formula 1",
@@ -79,17 +81,61 @@ SPORTS_KEYWORDS = [
     "cricket", "rugby", "volleyball", "handball",
     "esports", "counter-strike", "csgo", "cs2", "dota 2", "valorant",
     "league of legends", "overwatch", "call of duty",
+    "total kills", "first blood", "first dragon", "first baron",
+    "first tower", "in game 1", "in game 2", "in game 3", "in game 4",
+    "sentinels", "karmine corp", "team vitality", "fnatic",
+    "g2 esports", "cloud9", "team liquid", "nrg ",
     "moneyline", "parlay",
     "map winner", "map 1 winner", "map 2 winner", "map 3 winner",
     "(bo3)", "(bo5)", "(bo1)",
     "rushing yard", "receiving yard", "passing yard",
     "tackles", "sacks", "interceptions",
     "national anthem",
+    # College / team patterns that slip through
+    "bulldogs", "cougars", "gaels", "waves", "wildcats", "bears",
+    "tigers", "eagles", "hawks", "falcons", "panthers", "lions",
+    "cardinals", "raiders", "chargers", "knights", "spartans",
+    "trojans", "huskies", "bruins", "longhorns", "buckeyes",
+    "crimson tide", "blue devils", "tar heels", "jayhawks",
+    "hoosiers", "wolverines", "badgers", "cyclones", "sooners",
+    "razorbacks", "commodores", "volunteers", "aggies", "seminoles",
+    "gators", "hurricanes", "cavaliers", "hokies", "demon deacons",
+    "wolfpack", "orange", "boilermakers", "fighting irish",
+    "gonzaga", "pepperdine", "saint mary", "villanova", "marquette",
+    "creighton", "seton hall", "xavier", "depaul", "georgetown",
+    "march madness", "final four", "sweet sixteen", "elite eight",
+    # Over/under, spread, and score patterns
+    "o/u ", "spread:", "games total:", "total points",
+    "bobcats", "golden eagles", "tommies",
+    # Soccer / international sports / misc sports
+    "win on 202", "fc win", "fc lose", "fc draw",
+    "copa ", "league match",
+    "united win", "city win", "rovers win",
+    "toulon", "stade", "racing 92", "la rochelle", "clermont",
+    "big game:", "first timeout", "coin toss", "kickoff",
+    "halftime", "overtime", "penalty shootout",
+    "will the match end",
 ]
+
+# Keywords for crypto Up/Down micro-markets
+UP_DOWN_KEYWORDS = [
+    "up or down",
+]
+
+# Pattern: "Team A vs. Team B" or "Team A vs Team B"
+VS_PATTERN = re.compile(r'\bvs\.?\s', re.IGNORECASE)
 
 def is_sports_market(question, slug=""):
     text = (question + " " + slug).lower()
-    return any(kw in text for kw in SPORTS_KEYWORDS)
+    if any(kw in text for kw in SPORTS_KEYWORDS):
+        return True
+    if VS_PATTERN.search(question):
+        return True
+    return False
+
+def is_updown_market(question):
+    text = question.lower()
+    return any(kw in text for kw in UP_DOWN_KEYWORDS)
 CELL_STYLE = {
     "backgroundColor": COLORS["card"], "color": COLORS["text"],
     "border": f"1px solid {COLORS['border']}", "padding": "6px 8px",
@@ -357,10 +403,10 @@ def fetch_markets_page(end_min, end_max, offset=0, limit=100, active="true", clo
     return resp.json()
 
 
-def fetch_all_markets(end_min, end_max, active="true", closed="false"):
+def fetch_all_markets(end_min, end_max, active="true", closed="false", max_pages=50):
     all_m = []
     offset = 0
-    while True:
+    for _ in range(max_pages):
         page = fetch_markets_page(end_min, end_max, offset, active=active, closed=closed)
         if not page:
             break
@@ -369,6 +415,7 @@ def fetch_all_markets(end_min, end_max, active="true", closed="false"):
             break
         offset += 100
         time.sleep(REQUEST_DELAY)
+    print(f"[API] Fetched {len(all_m)} markets (offset reached {offset})", flush=True)
     return all_m
 
 
@@ -408,6 +455,19 @@ def parse_market(raw):
         outcomes = parse_json_field(raw.get("outcomes", "")) or ["Yes", "No"]
         prices_raw = parse_json_field(raw.get("outcomePrices", ""))
         prices = [float(p) for p in prices_raw] if prices_raw else []
+        # Detect resolution from outcomePrices: a resolved market has one price=1 and others=0
+        is_closed = raw.get("closed", False)
+        resolved = raw.get("resolved", False)
+        resolution = raw.get("resolution", "")
+        winning_outcome = None
+        if is_closed and prices and not resolved:
+            # Check if prices are all 0s and 1s (resolved)
+            rounded = [round(p) for p in prices]
+            if set(rounded) == {0, 1} and sum(rounded) == 1:
+                resolved = True
+                winner_idx = rounded.index(1)
+                winning_outcome = outcomes[winner_idx] if winner_idx < len(outcomes) else None
+                resolution = winning_outcome or ""
         return {
             "id": str(raw.get("id", "")),
             "question": raw.get("question", ""),
@@ -421,8 +481,9 @@ def parse_market(raw):
             "spread": safe_float(raw.get("spread")),
             "volume": float(raw.get("volumeNum", 0) or raw.get("volume", 0) or 0),
             "liquidity": float(raw.get("liquidityNum", 0) or raw.get("liquidity", 0) or 0),
-            "resolved": raw.get("resolved", False),
-            "resolution": raw.get("resolution", ""),
+            "resolved": resolved,
+            "resolution": resolution,
+            "closed": is_closed,
         }
     except Exception:
         return None
@@ -485,8 +546,9 @@ def scan_markets_with_books(hours_window, min_price, max_price, max_spend):
     end_max = (now + timedelta(hours=hours_window)).strftime("%Y-%m-%dT%H:%M:%SZ")
     raw = fetch_all_markets(end_min, end_max)
     markets = [m for m in (parse_market(r) for r in raw) if m and m["clob_ids"]]
-    # Filter out sports-related markets
-    markets = [m for m in markets if not is_sports_market(m["question"], m.get("slug", ""))]
+    # Filter out sports-related markets and Up/Down crypto micro-markets
+    markets = [m for m in markets if not is_sports_market(m["question"], m.get("slug", ""))
+               and not is_updown_market(m["question"])]
     all_rows, flagged_rows = [], []
     for m in markets:
         yes_p = m["prices"][0] if len(m["prices"]) >= 1 else None
@@ -549,6 +611,189 @@ def scan_markets_with_books(hours_window, min_price, max_price, max_spend):
                 })
     flagged_rows.sort(key=lambda r: r["_roi"], reverse=True)
     return all_rows, flagged_rows
+
+
+# ---------------------------------------------------------------------------
+# Backtesting Engine
+# ---------------------------------------------------------------------------
+
+def _fetch_pre_resolution_price(clob_token_id):
+    """Get the pre-resolution price for a token via CLOB price history.
+    Returns the price from ~1hr before the last data point (skipping terminal 0/1)."""
+    try:
+        resp = requests.get(f"{CLOB_API}/prices-history",
+                            params={"market": clob_token_id, "interval": "max", "fidelity": "1"},
+                            timeout=10)
+        if resp.status_code == 200:
+            history = resp.json().get("history", [])
+            if len(history) >= 3:
+                # Walk backward to find a non-terminal price (not exactly 0 or 1)
+                for pt in reversed(history[:-1]):
+                    p = float(pt.get("p", 0))
+                    if 0.005 < p < 0.995:
+                        return p
+                # If all points are terminal, use second-to-last
+                return float(history[-2].get("p", 0))
+    except Exception:
+        pass
+    return None
+
+
+def run_backtest(lookback_days=7, min_price=0.92, max_price=0.99, max_spend_per_trade=100,
+                 max_portfolio=1000, fee_rate=FEE_RATE, stop_loss_pct=0.20,
+                 max_markets=200):
+    """Fetch resolved markets and simulate the near-expiry strategy using real price history.
+
+    For each resolved market, fetches the CLOB price history to get the actual
+    pre-resolution price for each outcome. Only simulates trades where the
+    pre-resolution price falls within [min_price, max_price] — capturing both
+    wins (favourite resolves correctly) and losses (upsets).
+    """
+    now = datetime.now(timezone.utc)
+    end_min = (now - timedelta(days=lookback_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_max = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"[Backtest] Fetching resolved markets from {end_min} to {end_max}...", flush=True)
+
+    raw = fetch_all_markets(end_min, end_max, active="false", closed="true")
+    markets = [m for m in (parse_market(r) for r in raw) if m and m["clob_ids"]]
+    # Apply same filters as live scanner
+    markets = [m for m in markets if not is_sports_market(m["question"], m.get("slug", ""))
+               and not is_updown_market(m["question"])]
+    # Only resolved markets (detected from terminal outcomePrices)
+    markets = [m for m in markets if m.get("resolved") and m.get("resolution")]
+    # Dedup by market ID (Gamma can return duplicates)
+    seen_ids = set()
+    deduped = []
+    for m in markets:
+        if m["id"] not in seen_ids:
+            seen_ids.add(m["id"])
+            deduped.append(m)
+    markets = deduped
+
+    print(f"[Backtest] {len(markets)} resolved non-sports/non-updown markets found", flush=True)
+
+    # Limit to most recent markets to keep API calls reasonable
+    markets.sort(key=lambda m: m["end_date"], reverse=True)
+    markets = markets[:max_markets]
+    print(f"[Backtest] Checking price history for {len(markets)} markets...", flush=True)
+
+    trades = []
+    total_invested = 0.0
+    checked = 0
+
+    for m in markets:
+        # Identify the winning outcome index from terminal prices (1.0 = won)
+        winner_idx = None
+        for idx, p in enumerate(m["prices"]):
+            if round(p) == 1:
+                winner_idx = idx
+                break
+        if winner_idx is None:
+            continue
+
+        for i, outcome in enumerate(m["outcomes"]):
+            if i >= len(m["clob_ids"]):
+                continue
+
+            is_winner = (i == winner_idx)
+
+            # Fetch actual pre-resolution price from CLOB history
+            entry_price = _fetch_pre_resolution_price(m["clob_ids"][i])
+            time.sleep(REQUEST_DELAY)
+            checked += 1
+            if checked % 50 == 0:
+                print(f"[Backtest] ...checked {checked} tokens, {len(trades)} trades so far", flush=True)
+
+            if entry_price is None:
+                continue
+
+            # Only trade if price is in our target range
+            if not (min_price <= entry_price <= max_price):
+                continue
+
+            remaining = max_portfolio - total_invested
+            if remaining < 1.0:
+                continue
+
+            cost = min(max_spend_per_trade, remaining)
+            shares = cost / entry_price
+            actual_cost = shares * entry_price
+
+            payout = shares * 1.0 if is_winner else 0.0
+            gross_pnl = payout - actual_cost
+            fee = max(gross_pnl, 0) * fee_rate
+            net_pnl = gross_pnl - fee
+            roi = (net_pnl / actual_cost * 100) if actual_cost > 0 else 0
+
+            trades.append({
+                "market_id": m["id"],
+                "question": m["question"],
+                "side": outcome,
+                "entry_price": round(entry_price, 4),
+                "shares": round(shares, 2),
+                "cost": round(actual_cost, 2),
+                "resolution": m["resolution"],
+                "won": is_winner,
+                "result": "WIN" if is_winner else "LOSS",
+                "payout": round(payout, 2),
+                "net_pnl": round(net_pnl, 2),
+                "roi": round(roi, 2),
+                "end_date": m["end_date"].isoformat(),
+                "volume": m["volume"],
+                "liquidity": m["liquidity"],
+            })
+            total_invested += actual_cost
+
+    # Sort trades by end_date
+    trades.sort(key=lambda t: t["end_date"])
+    print(f"[Backtest] Simulated {len(trades)} trades", flush=True)
+
+    # Compute summary stats
+    n_trades = len(trades)
+    n_wins = sum(1 for t in trades if t["won"])
+    n_losses = n_trades - n_wins
+    win_rate = (n_wins / n_trades * 100) if n_trades > 0 else 0
+    total_pnl = sum(t["net_pnl"] for t in trades)
+    total_cost = sum(t["cost"] for t in trades)
+    total_roi = (total_pnl / total_cost * 100) if total_cost > 0 else 0
+    avg_win = (sum(t["net_pnl"] for t in trades if t["won"]) / n_wins) if n_wins > 0 else 0
+    avg_loss = (sum(t["net_pnl"] for t in trades if not t["won"]) / n_losses) if n_losses > 0 else 0
+    best_trade = max(trades, key=lambda t: t["net_pnl"]) if trades else None
+    worst_trade = min(trades, key=lambda t: t["net_pnl"]) if trades else None
+
+    # Equity curve
+    cum_pnl = []
+    running = 0
+    for t in trades:
+        running += t["net_pnl"]
+        cum_pnl.append(running)
+
+    # Max drawdown
+    peak = 0
+    max_dd = 0
+    for v in cum_pnl:
+        if v > peak:
+            peak = v
+        dd = peak - v
+        if dd > max_dd:
+            max_dd = dd
+
+    # Profit factor
+    gross_wins = sum(t["net_pnl"] for t in trades if t["net_pnl"] > 0)
+    gross_losses = abs(sum(t["net_pnl"] for t in trades if t["net_pnl"] < 0))
+    profit_factor = (gross_wins / gross_losses) if gross_losses > 0 else float("inf")
+
+    summary = {
+        "n_trades": n_trades, "n_wins": n_wins, "n_losses": n_losses,
+        "win_rate": round(win_rate, 1), "total_pnl": round(total_pnl, 2),
+        "total_cost": round(total_cost, 2), "total_roi": round(total_roi, 2),
+        "avg_win": round(avg_win, 2), "avg_loss": round(avg_loss, 2),
+        "best_trade": best_trade, "worst_trade": worst_trade,
+        "max_drawdown": round(max_dd, 2), "profit_factor": round(profit_factor, 2),
+        "cum_pnl": cum_pnl,
+    }
+
+    return trades, summary
 
 
 # ---------------------------------------------------------------------------
@@ -718,6 +963,64 @@ paper_tab = html.Div([
 ])
 
 
+backtest_tab = html.Div([
+    # Controls
+    html.Div(style={"display": "flex", "gap": "15px", "marginBottom": "15px", "flexWrap": "wrap", "alignItems": "flex-end"}, children=[
+        html.Div([html.Label("Lookback Days", style={"color": COLORS["muted"], "fontSize": "12px"}),
+                  dcc.Input(id="bt-days-input", type="number", value=7, min=1, max=90, style={**INPUT_STYLE, "width": "70px"})]),
+        html.Div([html.Label("Min Price", style={"color": COLORS["muted"], "fontSize": "12px"}),
+                  dcc.Input(id="bt-min-price", type="number", value=0.92, min=0.5, max=0.99, step=0.01, style={**INPUT_STYLE, "width": "70px"})]),
+        html.Div([html.Label("Max Price", style={"color": COLORS["muted"], "fontSize": "12px"}),
+                  dcc.Input(id="bt-max-price", type="number", value=0.99, min=0.5, max=1.0, step=0.01, style={**INPUT_STYLE, "width": "70px"})]),
+        html.Div([html.Label("Per Trade $", style={"color": COLORS["muted"], "fontSize": "12px"}),
+                  dcc.Input(id="bt-per-trade", type="number", value=100, min=10, step=10, style={**INPUT_STYLE, "width": "80px"})]),
+        html.Div([html.Label("Portfolio $", style={"color": COLORS["muted"], "fontSize": "12px"}),
+                  dcc.Input(id="bt-portfolio", type="number", value=1000, min=100, step=100, style={**INPUT_STYLE, "width": "90px"})]),
+        html.Div([html.Label("Fee %", style={"color": COLORS["muted"], "fontSize": "12px"}),
+                  dcc.Input(id="bt-fee", type="number", value=2, min=0, max=10, step=0.5, style={**INPUT_STYLE, "width": "60px"})]),
+        html.Button("Run Backtest", id="bt-run-btn", n_clicks=0, style={
+            "backgroundColor": COLORS["purple"], "color": "#fff", "border": "none",
+            "padding": "10px 24px", "borderRadius": "6px", "cursor": "pointer", "fontWeight": "bold"}),
+    ]),
+    dcc.Loading(id="loading-backtest", type="circle", color=COLORS["purple"],
+        overlay_style={"visibility": "visible"}, children=[
+        html.Div(id="bt-status", style={"padding": "10px 15px", "backgroundColor": COLORS["card"],
+            "borderRadius": "6px", "marginBottom": "15px", "border": f"1px solid {COLORS['border']}",
+            "color": COLORS["muted"], "fontSize": "13px"},
+            children="Configure parameters above and click Run Backtest."),
+        html.Div(id="bt-stats-cards", style={"display": "flex", "gap": "12px", "marginBottom": "15px", "flexWrap": "wrap"}),
+        # Charts row
+        html.Div(style={"display": "flex", "gap": "15px", "marginBottom": "15px", "flexWrap": "wrap"}, children=[
+            html.Div(style={"flex": "2", "minWidth": "400px", "backgroundColor": COLORS["card"], "borderRadius": "8px",
+                "border": f"1px solid {COLORS['border']}", "padding": "15px"}, children=[
+                html.H3("Equity Curve", style={"marginTop": "0", "color": COLORS["green"], "fontSize": "18px"}),
+                dcc.Graph(id="bt-equity-chart", config={"displayModeBar": False}, style={"height": "300px", "width": "100%"}),
+            ]),
+            html.Div(style={"flex": "1", "minWidth": "250px", "backgroundColor": COLORS["card"], "borderRadius": "8px",
+                "border": f"1px solid {COLORS['border']}", "padding": "15px"}, children=[
+                html.H3("Win / Loss", style={"marginTop": "0", "color": COLORS["blue"], "fontSize": "18px"}),
+                dcc.Graph(id="bt-winloss-chart", config={"displayModeBar": False}, style={"height": "300px", "width": "100%"}),
+            ]),
+        ]),
+        # PnL distribution
+        html.Div(style={"backgroundColor": COLORS["card"], "borderRadius": "8px",
+            "border": f"1px solid {COLORS['border']}", "padding": "15px", "marginBottom": "15px"}, children=[
+            html.H3("PnL Distribution", style={"marginTop": "0", "color": COLORS["yellow"], "fontSize": "18px"}),
+            dcc.Graph(id="bt-pnl-dist-chart", config={"displayModeBar": False}, style={"height": "280px", "width": "100%"}),
+        ]),
+        # Trade log
+        html.Div(style={"backgroundColor": COLORS["card"], "borderRadius": "8px",
+            "border": f"1px solid {COLORS['border']}", "padding": "15px", "marginBottom": "15px"}, children=[
+            html.H3("Trade Log", style={"marginTop": "0", "color": COLORS["text"], "fontSize": "18px"}),
+            html.Div(id="bt-trade-table"),
+        ]),
+    ]),
+    # Hidden stores for backtest data
+    dcc.Store(id="bt-trades-store"),
+    dcc.Store(id="bt-summary-store"),
+])
+
+
 app.layout = html.Div(style={
     "backgroundColor": COLORS["bg"], "color": COLORS["text"],
     "fontFamily": "'Segoe UI', -apple-system, sans-serif",
@@ -734,6 +1037,7 @@ app.layout = html.Div(style={
     dcc.Tabs(id="main-tabs", value="live", className="tab-container", children=[
         dcc.Tab(label="Live Scanner", value="live", className="tab", selected_className="tab--selected"),
         dcc.Tab(label="Paper Trading", value="paper", className="tab", selected_className="tab--selected"),
+        dcc.Tab(label="Backtesting", value="backtest", className="tab", selected_className="tab--selected"),
     ], style={"marginBottom": "15px"}),
     html.Div(id="tab-content"),
     html.Div(style={"textAlign": "center", "padding": "15px", "color": COLORS["muted"], "fontSize": "11px",
@@ -778,6 +1082,8 @@ app.clientside_callback(
 def render_tab(tab):
     if tab == "paper":
         return paper_tab
+    if tab == "backtest":
+        return backtest_tab
     return live_tab
 
 
@@ -1311,6 +1617,159 @@ def update_paper_visuals(trades):
     return cards, open_table, resolved_table, fig_equity, fig_wl
 
 
+# ----- Backtesting Callbacks -----
+
+@app.callback(
+    Output("bt-trades-store", "data"), Output("bt-summary-store", "data"),
+    Output("bt-status", "children"),
+    Input("bt-run-btn", "n_clicks"),
+    State("bt-days-input", "value"), State("bt-min-price", "value"),
+    State("bt-max-price", "value"), State("bt-per-trade", "value"),
+    State("bt-portfolio", "value"), State("bt-fee", "value"),
+    prevent_initial_call=True,
+)
+def do_backtest(n_clicks, days, min_p, max_p, per_trade, portfolio, fee_pct):
+    days = days or 7
+    min_p = min_p or 0.92
+    max_p = max_p or 0.99
+    per_trade = per_trade or 100
+    portfolio = portfolio or 1000
+    fee_rate = (fee_pct or 2) / 100.0
+    try:
+        trades, summary = run_backtest(
+            lookback_days=days, min_price=min_p, max_price=max_p,
+            max_spend_per_trade=per_trade, max_portfolio=portfolio, fee_rate=fee_rate,
+        )
+        now_str = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+        status = (f"Backtest complete at {now_str} | {summary['n_trades']} trades over {days} days | "
+                  f"Win rate: {summary['win_rate']}% | PnL: ${summary['total_pnl']:,.2f} | "
+                  f"ROI: {summary['total_roi']:.1f}% | Max DD: ${summary['max_drawdown']:,.2f}")
+        return trades, summary, status
+    except Exception as e:
+        return [], {}, f"Backtest failed: {e}"
+
+
+@app.callback(
+    Output("bt-stats-cards", "children"), Output("bt-equity-chart", "figure"),
+    Output("bt-winloss-chart", "figure"), Output("bt-pnl-dist-chart", "figure"),
+    Output("bt-trade-table", "children"),
+    Input("bt-trades-store", "data"), Input("bt-summary-store", "data"),
+    prevent_initial_call=True,
+)
+def update_backtest_visuals(trades, summary):
+    empty_fig = go.Figure()
+    empty_fig.update_layout(paper_bgcolor=COLORS["card"], plot_bgcolor=COLORS["card"],
+                            font_color=COLORS["muted"], height=280, autosize=False,
+                            xaxis=dict(visible=False), yaxis=dict(visible=False),
+                            annotations=[dict(text="Run backtest first", showarrow=False,
+                                              font=dict(size=16, color=COLORS["muted"]))])
+    if not trades or not summary:
+        return [], empty_fig, empty_fig, empty_fig, "No backtest data. Click Run Backtest."
+
+    # Stat cards
+    cards = [
+        make_stat_card("Trades", str(summary["n_trades"]), COLORS["blue"]),
+        make_stat_card("Wins", str(summary["n_wins"]), COLORS["green"]),
+        make_stat_card("Losses", str(summary["n_losses"]), COLORS["red"]),
+        make_stat_card("Win Rate", f"{summary['win_rate']}%",
+                       COLORS["green"] if summary["win_rate"] > 50 else COLORS["red"]),
+        make_stat_card("Total PnL", f"${summary['total_pnl']:,.2f}",
+                       COLORS["green"] if summary["total_pnl"] >= 0 else COLORS["red"]),
+        make_stat_card("Total ROI", f"{summary['total_roi']:.1f}%",
+                       COLORS["green"] if summary["total_roi"] >= 0 else COLORS["red"]),
+        make_stat_card("Avg Win", f"${summary['avg_win']:,.2f}", COLORS["green"]),
+        make_stat_card("Avg Loss", f"${summary['avg_loss']:,.2f}", COLORS["red"]),
+        make_stat_card("Max DD", f"${summary['max_drawdown']:,.2f}", COLORS["red"]),
+        make_stat_card("Profit Factor", f"{summary['profit_factor']:.2f}",
+                       COLORS["green"] if summary["profit_factor"] > 1 else COLORS["red"]),
+    ]
+
+    # Equity curve
+    cum_pnl = summary.get("cum_pnl", [])
+    fig_eq = go.Figure()
+    if cum_pnl:
+        final = cum_pnl[-1]
+        fig_eq.add_trace(go.Scatter(
+            x=list(range(1, len(cum_pnl) + 1)), y=cum_pnl,
+            fill="tozeroy", name="Cumulative PnL",
+            line=dict(color=COLORS["green"] if final >= 0 else COLORS["red"], width=2),
+            fillcolor="rgba(63,185,80,0.15)" if final >= 0 else "rgba(248,81,73,0.15)",
+        ))
+        fig_eq.add_hline(y=0, line_dash="dash", line_color=COLORS["muted"])
+    fig_eq.update_layout(
+        paper_bgcolor=COLORS["card"], plot_bgcolor=COLORS["bg"], font_color=COLORS["text"],
+        margin=dict(l=50, r=20, t=20, b=40), height=280, autosize=False,
+        xaxis=dict(title="Trade #", gridcolor=COLORS["border"]),
+        yaxis=dict(title="Cumulative PnL ($)", gridcolor=COLORS["border"]),
+        showlegend=False,
+    )
+
+    # Win/Loss bar
+    fig_wl = go.Figure()
+    fig_wl.add_trace(go.Bar(
+        x=["Wins", "Losses"], y=[summary["n_wins"], summary["n_losses"]],
+        marker_color=[COLORS["green"], COLORS["red"]],
+        text=[str(summary["n_wins"]), str(summary["n_losses"])], textposition="auto",
+        textfont=dict(color=COLORS["text"], size=16),
+    ))
+    fig_wl.update_layout(
+        paper_bgcolor=COLORS["card"], plot_bgcolor=COLORS["bg"], font_color=COLORS["text"],
+        margin=dict(l=40, r=20, t=20, b=40), height=280, autosize=False,
+        xaxis=dict(gridcolor=COLORS["border"]),
+        yaxis=dict(title="Count", gridcolor=COLORS["border"]),
+        showlegend=False,
+    )
+
+    # PnL distribution histogram
+    fig_dist = go.Figure()
+    pnl_vals = [t["net_pnl"] for t in trades]
+    fig_dist.add_trace(go.Histogram(
+        x=pnl_vals, nbinsx=30,
+        marker_color=COLORS["purple"], marker_line=dict(color=COLORS["border"], width=1),
+    ))
+    fig_dist.add_vline(x=0, line_dash="dash", line_color=COLORS["muted"])
+    fig_dist.update_layout(
+        paper_bgcolor=COLORS["card"], plot_bgcolor=COLORS["bg"], font_color=COLORS["text"],
+        margin=dict(l=50, r=20, t=20, b=40), height=260, autosize=False,
+        xaxis=dict(title="PnL ($)", gridcolor=COLORS["border"]),
+        yaxis=dict(title="Count", gridcolor=COLORS["border"]),
+        showlegend=False,
+    )
+
+    # Trade log table
+    trade_rows = [{
+        "market": t["question"],
+        "side": t["side"],
+        "entry": f"{t['entry_price']:.4f}",
+        "shares": f"{t['shares']:,.1f}",
+        "cost": f"${t['cost']:,.2f}",
+        "resolution": t["resolution"],
+        "result": t["result"],
+        "pnl": f"${t['net_pnl']:,.2f}",
+        "roi": f"{t['roi']:.1f}%",
+        "end_date": t["end_date"][:16],
+    } for t in trades]
+
+    trade_table = dash_table.DataTable(
+        columns=[{"name": n, "id": i} for n, i in [
+            ("Market", "market"), ("Side", "side"), ("Entry", "entry"),
+            ("Shares", "shares"), ("Cost", "cost"), ("Resolution", "resolution"),
+            ("Result", "result"), ("PnL", "pnl"), ("ROI", "roi"), ("End Date", "end_date")]],
+        data=trade_rows, style_table={"overflowX": "auto"}, style_header=HEADER_STYLE,
+        style_cell={**CELL_STYLE, "maxWidth": "200px", "overflow": "hidden", "textOverflow": "ellipsis"},
+        style_cell_conditional=[{"if": {"column_id": "market"}, "maxWidth": "400px", "minWidth": "200px", "whiteSpace": "normal"}],
+        style_data_conditional=[
+            {"if": {"filter_query": '{result} = "WIN"', "column_id": "result"}, "color": COLORS["green"], "fontWeight": "bold"},
+            {"if": {"filter_query": '{result} = "LOSS"', "column_id": "result"}, "color": COLORS["red"], "fontWeight": "bold"},
+            {"if": {"filter_query": '{result} = "LOSS"'}, "backgroundColor": "#2a1015", "border": f"1px solid {COLORS['red']}"},
+            {"if": {"filter_query": '{result} = "WIN"'}, "backgroundColor": "#0d2818"},
+        ],
+        page_size=25, sort_action="native",
+    )
+
+    return cards, fig_eq, fig_wl, fig_dist, trade_table
+
+
 # ---------------------------------------------------------------------------
 # Entry Point
 # ---------------------------------------------------------------------------
@@ -1322,7 +1781,7 @@ def main():
     args = parser.parse_args()
     print(f"\nPolymarket Near-Expiry Dashboard")
     print(f"  Open http://127.0.0.1:{args.port}")
-    print(f"  Tabs: Live Scanner | Paper Trading")
+    print(f"  Tabs: Live Scanner | Paper Trading | Backtesting")
     print(f"  Press Ctrl+C to stop.\n")
     app.run(debug=not args.no_debug, port=args.port, host="127.0.0.1")
 
